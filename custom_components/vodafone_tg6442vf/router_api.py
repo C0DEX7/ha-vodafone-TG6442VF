@@ -1,4 +1,5 @@
 """API Client for Vodafone Station TG6442VF."""
+import hashlib
 import logging
 import aiohttp
 
@@ -18,35 +19,34 @@ class VodafoneStationAPI:
         self.password = password
         self.session = session or aiohttp.ClientSession()
         
-        # Arris routers expect standard browser headers
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             "Origin": self.host,
             "Referer": f"{self.host}/index.html"
         }
 
     async def login(self) -> bool:
-        """Attempt to authenticate against the router's Arris backend."""
+        """Attempt to authenticate by hashing credentials matching the router footprint."""
         try:
-            _LOGGER.debug("Testing basic connectivity to gateway landing page: %s", self.host)
-            async with self.session.get(f"{self.host}/index.html", headers=self.headers, timeout=10) as response:
-                if response.status != 200:
-                    _LOGGER.error("Router rejected baseline landing page request with status %s", response.status)
-                    return False
-
-            # The TG6442VF backend uses /data/Login.json for session validation
-            login_url = f"{self.host}/data/Login.json"
+            # 1. Generate the SHA-256 hash of the password to match your browser's footprint
+            password_bytes = self.password.encode("utf-8")
+            hashed_password = hashlib.sha256(password_bytes).hexdigest()
             
-            # Arris firmware typically maps login inputs using these specific keys
+            # 2. Build the payload matching the exact case and structure you intercepted
             payload = {
-                "login_username": self.username,
-                "login_password": self.password
+                "AuthData": "loginPassword",
+                "EncryptData": hashed_password,
+                "Name": self.username
             }
 
-            _LOGGER.debug("Sending authentication payload to %s", login_url)
+            # Based on the AuthData structure, Arris/CommScope endpoints usually hit /data/Login.json 
+            # or a root data processing endpoint. We will use the structured path.
+            login_url = f"{self.host}/data/Login.json"
             
-            # Sending as standard application/json POST
+            _LOGGER.debug("Sending encrypted authentication payload to %s", login_url)
+            
             async with self.session.post(login_url, json=payload, headers=self.headers, timeout=10) as response:
                 _LOGGER.debug("Authentication endpoint response status: %s", response.status)
                 
@@ -54,16 +54,14 @@ class VodafoneStationAPI:
                     raw_text = await response.text()
                     _LOGGER.debug("Login raw response payload: %s", raw_text)
                     
-                    # A 200 status doesn't always mean success if the password was wrong.
-                    # The router might return a JSON body like {"result": "success"} or {"error": 0}
-                    if "false" in raw_text.lower() or "error" in raw_text.lower():
-                        _LOGGER.error("Router accepted the request but rejected the credentials.")
+                    if "false" in raw_text.lower() or "error" in raw_text.lower() or "fail" in raw_text.lower():
+                        _LOGGER.error("Router rejected the encrypted credentials. Check your username/password.")
                         return False
                         
-                    _LOGGER.info("Successfully authenticated with Vodafone Station TG6442VF")
+                    _LOGGER.info("Successfully authenticated with Vodafone Station TG6442VF via encryption handshake")
                     return True
                 
-                _LOGGER.error("Authentication endpoint rejected connection with status code: %s", response.status)
+                _LOGGER.error("Authentication endpoint failed with status code: %s", response.status)
                 return False
 
         except aiohttp.ClientConnectorError as err:
@@ -74,19 +72,13 @@ class VodafoneStationAPI:
             return False
 
     async def async_get_data(self) -> dict:
-        """Unified state and diagnostic framework placeholder."""
-        # Clean execution path mapping for data loop coordinator
+        """Unified state framework placeholder."""
         return {
-            "sys_info": {"firmware": "19.3B70-1.2.49", "wan_status": "Connected", "wan_ip": "10.0.0.1"},
-            "wifi": {"2g_enabled": True, "5g_enabled": True, "guest_enabled": False},
-            "docsis": {"downstream_snr": 38.2, "upstream_power": 44.5},
+            "sys_info": {"firmware": "TG6442VF_v1.0", "wan_status": "Connected"},
             "devices": {}
         }
 
-    async def async_set_wifi_state(self, band: str, state: bool) -> bool:
-        """Placeholder for radio state mutators."""
-        return True
-
-    async def async_reboot(self) -> bool:
-        """Placeholder for systemic reboot triggers."""
-        return True
+    async def async_close(self):
+        """Close the session tracking framework safely."""
+        if self.session:
+            await self.session.close()
