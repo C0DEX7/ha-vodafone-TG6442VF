@@ -1,1 +1,2 @@
 # ha-vodafone-TG6442V
+test
