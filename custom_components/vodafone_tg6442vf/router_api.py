@@ -1,6 +1,8 @@
 """API Client for Vodafone Station TG6442VF."""
 import logging
 import aiohttp
+import hashlib
+import base64
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +28,19 @@ class VodafoneStationAPI:
             "Referer": f"{self.host}/index.html"
         }
 
+    def _encrypt_password(self, salt: str = "") -> str:
+        """
+        Encrypts the password to match the router's Javascript logic.
+        Uncomment the method that matches your specific firmware version.
+        """
+        
+        # METHOD 1: Base64 Encoding (Very common for Vodafone Stations)
+        return base64.b64encode(self.password.encode('utf-8')).decode('utf-8')
+
+        # METHOD 2: SHA256 Hashing (Used in newer CommScope/Arris firmwares)
+        # hashed = hashlib.sha256(f"{salt}{self.password}".encode('utf-8')).hexdigest()
+        # return hashed
+
     async def login(self) -> bool:
         """Attempt to authenticate by matching the router's exact session flow."""
         try:
@@ -35,17 +50,19 @@ class VodafoneStationAPI:
                 await response.text()
                 _LOGGER.debug("Initial handshake cookies obtained: %s", self.session.cookie_jar.filter_cookies(self.host))
 
-            # Step 2: Attempt to pull a token data challenge if the firmware uses it
-            # Some variants use /data/get_session.json or pass tokens in the body.
-            # We'll post directly using the browser signature keys you uncovered.
+            # Note: If your router passes a dynamic salt/token in the HTML body or headers, 
+            # extract it here and pass it into the _encrypt_password function.
+            salt = "" 
+
+            # Step 2: Attempt to pull a token data challenge
             login_url = f"{self.host}/data/Login.json"
             
-            # Since the browser uses an explicit runtime variable encryption layer 
-            # for "EncryptData", we're going to try passing the raw credentials 
-            # formatted matching the payload object schema.
+            # Encrypt the password before sending
+            encrypted_password = self._encrypt_password(salt)
+
             payload = {
                 "AuthData": "loginPassword",
-                "EncryptData": self.password,  # Sending token credentials
+                "EncryptData": encrypted_password, 
                 "Name": self.username
             }
 
@@ -76,6 +93,7 @@ class VodafoneStationAPI:
 
     async def async_get_data(self) -> dict:
         """Unified data state mapping container."""
+        # Note: You will need to expand this to actually fetch data after a successful login!
         return {"sys_info": {"connected": True}, "devices": {}}
 
     async def async_close(self):
