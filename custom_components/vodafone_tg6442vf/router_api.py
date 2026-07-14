@@ -1,262 +1,245 @@
-"""API Client for the Vodafone Station Wi-Fi 6 (TG6442VF) with Compal/Arris Firmware."""
-import logging
-import asyncio
-import random
-from typing import Any, Dict, Optional
-from aiohttp import ClientSession
+"""API client for the Vodafone Station TG6442VF (Sercomm-based firmware).
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+This router does NOT expose the newer `/api/v1/...` JSON API that some other
+Vodafone Station models use. Instead, like other Sercomm-based Vodafone
+Station units, it uses an older `/php/*.php` AJAX API with a session cookie
+and a per-request cache-busting `_n` query parameter.
+
+Login is a two-step dance:
+    1. GET the login page to establish a session cookie (and, on some
+       firmwares, read a nonce/salt embedded in the page or returned by a
+       companion endpoint).
+    2. POST the encrypted password to /php/ajaxSet_Password.php.
+
+IMPORTANT - the `_encrypt_password` method below is a best-effort starting
+point, not a confirmed implementation. Sercomm firmwares vary in exactly how
+they transform the password client-side before it's sent as `EncryptData`.
+If login still fails after wiring this up, open http://<router-ip>/login.html
+in a browser, check the page source / Sources tab in devtools for the JS
+function invoked right before the POST to ajaxSet_Password.php, and swap the
+body of `_encrypt_password` for a faithful Python port of it.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import time
+from typing import Any
+
+import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
+LOGIN_PAGE = "/login.html"
+LOGIN_ENDPOINT = "/php/ajaxSet_Password.php"
+REBOOT_ENDPOINT = "/php/ajaxSet_status_restart.php"
+WIFI_ENDPOINT = "/php/ajaxSet_wifi.php"
+DEVICES_ENDPOINT = "/php/ajaxGet_device_list.php"
+SYSINFO_ENDPOINT = "/php/ajaxGet_status_docsis_data.php"
+
+DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+
+class VodafoneStationAuthError(Exception):
+    """Raised when login fails (bad credentials or unexpected response)."""
+
+
+class VodafoneStationConnectionError(Exception):
+    """Raised when the router can't be reached at all."""
+
+
+def _cache_buster() -> str:
+    """Router expects a changing _n query param on every AJAX call."""
+    return str(int(time.time() * 1000))
+
+
 class VodafoneStationAPI:
-    """Interface to communicate with the Vodafone Station TG6442VF router."""
+    """Thin async client around the TG6442VF's legacy PHP AJAX endpoints."""
 
-    def __init__(self, host: str, username: str, password: str, session: ClientSession):
-        """Initialize the API client."""
-        self.host = host
-        self.username = username
-        self.password = password
-        self.session = session
+    def __init__(self, host: str, username: str, password: str, session: aiohttp.ClientSession):
+        self._host = host.rstrip("/")
+        self._username = username
+        self._password = password
+        self._session = session
+        self._base_url = f"http://{self._host}"
+        self._logged_in = False
 
-    async def _fetch_php_endpoint(self, endpoint_name: str) -> Optional[Any]:
+    def _encrypt_password(self, nonce: str) -> str:
+        """Best-effort password transform — VERIFY against your router's login.js.
+
+        Placeholder scheme: SHA-256(password + nonce), hex-encoded. Swap this
+        out once you've confirmed the real client-side function from the
+        router's own JavaScript (see module docstring).
         """
-        Fetch data from a PHP AJAX endpoint.
-        Handles minor underscore variations to prevent future firmware updates from breaking things.
-        """
-        n_val = random.randint(10000, 99999)
-        variations = [
-            f"php/{endpoint_name}.php",
-        ]
-        if "_" in endpoint_name:
-            variations.append(f"php/{endpoint_name.replace('_', '')}.php")
+        digest = hashlib.sha256(f"{self._password}{nonce}".encode()).hexdigest()
+        return digest
 
-        for path in variations:
-            url = f"http://{self.host}/{path}?_n={n_val}"
-            try:
-                async with self.session.get(url) as response:
-                    if response.status == 200:
-                        try:
-                            return await response.json()
-                        except Exception:
-                            # Some endpoints might return raw text or HTML on error
-                            text = await response.text()
-                            _LOGGER.debug("Non-JSON response from %s: %s", url, text[:200])
-                            return text
-            except Exception as err:
-                _LOGGER.debug("Failed to fetch path %s: %s", url, err)
-        return None
+    async def _get_login_nonce(self) -> str:
+        """Fetch the login page and establish the session cookie.
+
+        Also tries to pull a nonce/salt out of the page if one is present.
+        Falls back to an empty string if none is found — some firmwares
+        don't require one and simply rely on the session cookie.
+        """
+        url = f"{self._base_url}{LOGIN_PAGE}"
+        try:
+            async with self._session.get(url, timeout=DEFAULT_TIMEOUT) as resp:
+                if resp.status != 200:
+                    raise VodafoneStationConnectionError(
+                        f"Unexpected status {resp.status} loading {url}"
+                    )
+                text = await resp.text()
+        except aiohttp.ClientError as err:
+            raise VodafoneStationConnectionError(
+                f"Connection error communicating with Vodafone Station at {url}: {err}"
+            ) from err
+
+        # Common patterns for an embedded nonce/salt on Sercomm login pages.
+        for marker in ("var myNonce", "var loginNonce", "loginToken"):
+            idx = text.find(marker)
+            if idx != -1:
+                snippet = text[idx: idx + 120]
+                _LOGGER.debug("Found potential nonce marker %r near: %s", marker, snippet)
+
+        return ""
 
     async def login(self) -> bool:
-        """Authenticate with the router using RSA-encrypted credentials."""
-        _LOGGER.debug("Attempting login sequence with Vodafone Station at %s", self.host)
+        """Authenticate against the router. Returns True on success."""
+        nonce = await self._get_login_nonce()
+        encrypted = self._encrypt_password(nonce)
 
-        # Step 1: Fetch the RSA Public Key Certificate
-        cert_data = await self._fetch_php_endpoint("ajaxGet_Cert")
-        if not cert_data or not isinstance(cert_data, dict) or "cert" not in cert_data:
-            _LOGGER.error("Failed to retrieve RSA encryption certificate from router. Ensure you are connected to the router network.")
-            return False
-
-        cert_pem = cert_data["cert"]
-
-        # Step 2: Encrypt password using the RSA Public Key with PKCS1v15 padding
-        try:
-            public_key = serialization.load_pem_public_key(cert_pem.encode('utf-8'))
-            encrypted_bytes = public_key.encrypt(
-                self.password.encode('utf-8'),
-                padding.PKCS1v15()
-            )
-            encrypt_data = encrypted_bytes.hex()
-        except Exception as err:
-            _LOGGER.error("Failed to encrypt password using retrieved certificate: %s", err)
-            return False
-
-        # Step 3: POST the payload to the login handler
-        n_val = random.randint(10000, 99999)
-        login_url = f"http://{self.host}/php/ajaxSet_Password.php?_n={n_val}"
-        
-        # This firmware expects x-www-form-urlencoded format
+        url = f"{self._base_url}{LOGIN_ENDPOINT}?_n={_cache_buster()}"
         payload = {
             "AuthData": "loginPassword",
-            "EncryptData": encrypt_data,
-            "Name": self.username
+            "EncryptData": encrypted,
+            "Name": self._username,
+        }
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{self._base_url}{LOGIN_PAGE}",
         }
 
         try:
-            async with self.session.post(login_url, data=payload) as response:
-                response.raise_for_status()
-                resp_text = await response.text()
-                _LOGGER.debug("Login response: %s", resp_text)
+            async with self._session.post(
+                url, data=payload, headers=headers, timeout=DEFAULT_TIMEOUT
+            ) as resp:
+                if resp.status != 200:
+                    raise VodafoneStationConnectionError(
+                        f"Unexpected status {resp.status} posting to {url}"
+                    )
+                body = await resp.text()
+        except aiohttp.ClientError as err:
+            raise VodafoneStationConnectionError(
+                f"Connection error communicating with Vodafone Station at {url}: {err}"
+            ) from err
 
-                # A successful login request validates the current cookie session in aiohttp
-                if "success" in resp_text.lower() or "ok" in resp_text.lower() or response.status == 200:
-                    _LOGGER.info("Successfully authenticated with Vodafone Station.")
-                    return True
-        except Exception as err:
-            _LOGGER.error("Network error during login post: %s", err)
+        _LOGGER.debug("Login response: %s", body)
 
+        # Sercomm firmwares typically respond with a JSON blob containing
+        # something like {"status": "success"} or an error code/message on
+        # failure. Adjust this check once you've seen a real success payload.
+        if '"status"' in body and "success" in body.lower():
+            self._logged_in = True
+            return True
+
+        if "error" in body.lower() or "fail" in body.lower():
+            _LOGGER.warning(
+                "Failed to authenticate with Vodafone Station. "
+                "Invalid credentials, or the encryption scheme in "
+                "_encrypt_password doesn't match this firmware yet."
+            )
+            return False
+
+        # Unknown response shape — log it so it can be inspected and the
+        # success/failure check above refined.
+        _LOGGER.warning(
+            "Unrecognized login response from Vodafone Station; "
+            "treating as failure. Body was: %s",
+            body[:500],
+        )
         return False
 
-    async def async_get_data(self) -> Dict[str, Any]:
-        """Fetch and compile all router data for Home Assistant."""
-        # Check authentication by attempting to fetch basic system info
-        sys_resp = await self._fetch_php_endpoint("ajaxGet_System_Info")
-        if sys_resp is None or (isinstance(sys_resp, str) and "login" in sys_resp.lower()):
-            _LOGGER.debug("Session expired or unauthenticated. Logging in...")
-            if not await self.login():
-                raise Exception("Authentication with Vodafone Station failed.")
-            sys_resp = await self._fetch_php_endpoint("ajaxGet_System_Info")
+    async def _ensure_logged_in(self) -> None:
+        if not self._logged_in and not await self.login():
+            raise VodafoneStationAuthError("Not authenticated with Vodafone Station")
 
-        # Concurrently fetch other data sets to maximize responsiveness
-        tasks = [
-            self._fetch_php_endpoint("ajaxGet_DocsisStatus"),
-            self._fetch_php_endpoint("ajaxGet_WifiSettings"),
-            self._fetch_php_endpoint("ajaxGet_LanUserList")
-        ]
-        docsis_resp, wifi_resp, devices_resp = await asyncio.gather(*tasks)
+    async def _get_json(self, endpoint: str) -> Any:
+        await self._ensure_logged_in()
+        url = f"{self._base_url}{endpoint}?_n={_cache_buster()}"
+        try:
+            async with self._session.get(url, timeout=DEFAULT_TIMEOUT) as resp:
+                if resp.status == 401 or resp.status == 403:
+                    # Session expired — retry once after a fresh login.
+                    self._logged_in = False
+                    await self._ensure_logged_in()
+                    async with self._session.get(url, timeout=DEFAULT_TIMEOUT) as retry_resp:
+                        retry_resp.raise_for_status()
+                        return await retry_resp.json(content_type=None)
+                resp.raise_for_status()
+                return await resp.json(content_type=None)
+        except aiohttp.ClientError as err:
+            raise VodafoneStationConnectionError(
+                f"Connection error fetching {url}: {err}"
+            ) from err
 
-        # --- 1. Parse System Info ---
-        firmware = "Unknown"
-        wan_status = "Disconnected"
-        wan_ip = "0.0.0.0"
-        if isinstance(sys_resp, dict):
-            firmware = sys_resp.get("sys_firmware") or sys_resp.get("firmware_version") or "Unknown"
-            wan_status = sys_resp.get("sys_wan_status") or sys_resp.get("wan_status") or "Unknown"
-            wan_ip = sys_resp.get("sys_wan_ip") or sys_resp.get("wan_ip") or "0.0.0.0"
+    async def async_get_data(self) -> dict[str, Any]:
+        """Poll the router and normalize data for the coordinator.
 
-        # --- 2. Parse DOCSIS telemetry ---
-        downstream_snr = 0.0
-        upstream_power = 0.0
-        if isinstance(docsis_resp, dict):
-            # Safe extraction from lists (taking the first channel's value)
-            ds_channels = docsis_resp.get("downstream") or docsis_resp.get("ds_channels") or []
-            if ds_channels and isinstance(ds_channels, list) and isinstance(ds_channels[0], dict):
-                downstream_snr = float(ds_channels[0].get("snr") or ds_channels[0].get("SNR") or 0.0)
-
-            us_channels = docsis_resp.get("upstream") or docsis_resp.get("us_channels") or []
-            if us_channels and isinstance(us_channels, list) and isinstance(us_channels[0], dict):
-                upstream_power = float(us_channels[0].get("power") or us_channels[0].get("Power") or 0.0)
-
-        # --- 3. Parse Wi-Fi Radio Settings ---
-        wifi_data = {
-            "2g_enabled": False,
-            "5g_enabled": False,
-            "guest_enabled": False
-        }
-        if isinstance(wifi_resp, dict):
-            for k, v in wifi_resp.items():
-                val = str(v).lower() in ["1", "true", "yes", "on", "enable", "enabled"]
-                k_lower = k.lower()
-                if "24" in k_lower or "2g" in k_lower or "radio_2" in k_lower:
-                    wifi_data["2g_enabled"] = val
-                elif "5" in k_lower or "5g" in k_lower or "radio_5" in k_lower:
-                    wifi_data["5g_enabled"] = val
-                elif "guest" in k_lower:
-                    wifi_data["guest_enabled"] = val
-
-        # --- 4. Parse Client Devices list ---
-        devices_data = self._parse_devices(devices_resp)
+        NOTE: the endpoint names/JSON shapes here are placeholders matching
+        what other Sercomm Vodafone Station models expose. Once login is
+        confirmed working, inspect the Network tab for the actual endpoints
+        this router's dashboard calls (system info, DOCSIS, Wi-Fi, connected
+        devices) and adjust the paths and parsing below to match.
+        """
+        sys_info_raw = await self._get_json(SYSINFO_ENDPOINT)
+        devices_raw = await self._get_json(DEVICES_ENDPOINT)
 
         return {
             "sys_info": {
-                "firmware": firmware,
-                "wan_status": wan_status,
-                "wan_ip": wan_ip,
+                "firmware": sys_info_raw.get("firmware", "Unknown"),
+                "wan_status": sys_info_raw.get("wan_status", "Unknown"),
+                "wan_ip": sys_info_raw.get("wan_ip", "Unknown"),
             },
             "docsis": {
-                "downstream_snr": downstream_snr,
-                "upstream_power": upstream_power,
+                "downstream_snr": sys_info_raw.get("downstream_snr"),
+                "upstream_power": sys_info_raw.get("upstream_power"),
             },
-            "wifi": wifi_data,
-            "devices": devices_data
+            "wifi": {
+                "2g_enabled": sys_info_raw.get("wifi_2g_enabled", False),
+                "5g_enabled": sys_info_raw.get("wifi_5g_enabled", False),
+                "guest_enabled": sys_info_raw.get("wifi_guest_enabled", False),
+            },
+            "devices": {
+                mac: {"name": info.get("name", mac), "connected": info.get("connected", False)}
+                for mac, info in devices_raw.items()
+            } if isinstance(devices_raw, dict) else {},
         }
 
-    def _parse_devices(self, raw_data: Any) -> Dict[str, Dict[str, Any]]:
-        """Parse raw device tables into Home Assistant tracking dictionaries."""
-        parsed = {}
-        if not raw_data:
-            return parsed
-
-        client_list = []
-        if isinstance(raw_data, list):
-            client_list = raw_data
-        elif isinstance(raw_data, dict):
-            for key in ["lan_user_list", "clients", "devices", "list"]:
-                if key in raw_data and isinstance(raw_data[key], list):
-                    client_list = raw_data[key]
-                    break
-
-        for client in client_list:
-            if not isinstance(client, dict):
-                continue
-
-            mac = None
-            for mac_key in ["MACAddr", "mac", "mac_address", "Mac"]:
-                if mac_key in client:
-                    mac = client[mac_key]
-                    break
-
-            if not mac:
-                continue
-
-            name = None
-            for name_key in ["DeviceName", "hostname", "name", "HostName"]:
-                if name_key in client:
-                    name = client[name_key]
-                    break
-            if not name:
-                name = f"Device_{mac[-8:].replace(':', '')}"
-
-            connected = False
-            for conn_key in ["Online", "active", "connected", "state"]:
-                if conn_key in client:
-                    val = client[conn_key]
-                    if str(val).lower() in ["1", "true", "yes", "online", "up"]:
-                        connected = True
-                    break
-
-            parsed[mac] = {
-                "name": name,
-                "connected": connected
-            }
-        return parsed
-
-    async def async_reboot(self) -> None:
-        """Trigger a reboot request to the router."""
-        _LOGGER.info("Initiating Vodafone Station reboot sequence.")
-        n_val = random.randint(10000, 99999)
-        url = f"http://{self.host}/php/ajaxSet_Reboot.php?_n={n_val}"
-        payload = {"action": "reboot", "reboot": "1"}
+    async def async_reboot(self) -> bool:
+        """Trigger a router reboot."""
+        await self._ensure_logged_in()
+        url = f"{self._base_url}{REBOOT_ENDPOINT}?_n={_cache_buster()}"
         try:
-            async with self.session.post(url, data=payload) as response:
-                if response.status == 200:
-                    _LOGGER.info("Reboot command acknowledged by router.")
-                else:
-                    _LOGGER.warning("Reboot endpoint rejected signal with status: %s", response.status)
-        except Exception as err:
-            _LOGGER.error("Failed to execute reboot: %s", err)
+            async with self._session.post(
+                url, data={"restart": "1"}, timeout=DEFAULT_TIMEOUT
+            ) as resp:
+                resp.raise_for_status()
+                return True
+        except aiohttp.ClientError as err:
+            _LOGGER.error("Failed to reboot Vodafone Station: %s", err)
+            return False
 
-    async def async_set_wifi_state(self, band: str, state: bool) -> bool:
-        """Enable or disable target Wi-Fi radios."""
-        _LOGGER.info("Setting Wi-Fi band %s state to %s", band, state)
-        n_val = random.randint(10000, 99999)
-        url = f"http://{self.host}/php/ajaxSet_WifiSettings.php?_n={n_val}"
-        
-        val_str = "1" if state else "0"
-        payload = {}
-        if band == "2g":
-            payload = {"wifi_24g_enable": val_str}
-        elif band == "5g":
-            payload = {"wifi_5g_enable": val_str}
-        elif band == "guest":
-            payload = {"wifi_guest_enable": val_str}
-
+    async def async_set_wifi_state(self, band: str, enabled: bool) -> bool:
+        """Enable or disable a Wi-Fi radio band ('2g', '5g', or 'guest')."""
+        await self._ensure_logged_in()
+        url = f"{self._base_url}{WIFI_ENDPOINT}?_n={_cache_buster()}"
+        payload = {"band": band, "enabled": "1" if enabled else "0"}
         try:
-            async with self.session.post(url, data=payload) as response:
-                if response.status == 200:
-                    _LOGGER.info("Wi-Fi configuration successfully updated.")
-                    return True
-        except Exception as err:
-            _LOGGER.error("Failed to commit Wi-Fi state alteration: %s", err)
-        return False
+            async with self._session.post(
+                url, data=payload, timeout=DEFAULT_TIMEOUT
+            ) as resp:
+                resp.raise_for_status()
+                return True
+        except aiohttp.ClientError as err:
+            _LOGGER.error("Failed to set Wi-Fi state (%s -> %s): %s", band, enabled, err)
+            return False
